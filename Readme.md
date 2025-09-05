@@ -32,7 +32,7 @@ When a user gives a prompt:
    - Stores results in `subagent_result` of State.  
 
 3. **Subagents**  
-   - Choose the appropriate tool(s) from available **MCP server tools**.  
+   - Chooses the appropriate tool(s) from available **MCP server tools**.  
    - Generate the required SQL query.  
    - Queries are validated for **SQL safety** before execution.  
    - If safe → `run_query` tool executes the query and returns results.  
