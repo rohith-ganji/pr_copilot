@@ -1,155 +1,100 @@
 """
-PR metrics calculations (enhanced).
+PR metrics via LLM-generated SQL.
 
 Features:
-- Named metric mapping (METRIC_MAP).
-- Aggregations: avg/min/max/sum/count.
-- Percentiles: p50/p75/p90/p95/p99 (via PERCENTILE_CONT).
-- Grouping support (group_by column name).
-- Top-N ranking support (top_n).
-- Windowing by createdon (window_days).
-- Parameterized filters (dict) to avoid SQL injection.
-- Uses is_safe_sql(...) to validate generated SQL.
-- Returns {"metric", "window_days", "sql", "params", "explanation", "data"}.
+- LLM generates full SQL based on user natural language prompt.
+- SQL is validated with is_safe_sql.
+- Returns {"sql", "params", "data"} or {"error": "..."}.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict
 from psycopg2.extras import RealDictCursor
 from connection import get_connection
 from sql_guard import is_safe_sql
+import os, json
+from openai import OpenAI
 
-METRIC_MAP = {
-    "cycle_time": "cycletimeduration",
-    "review_latency": "opentoreviewduration",
-    "approval_latency": "reviewedtoapprovedduration",
-    "churn": "(linesadded + linesremoved)",
-    "throughput": "1"  # throughput is COUNT(*); we handle specially
-}
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-AGG_FUNCS = {"avg", "min", "max", "sum", "count"}
-PERCENTILE_MAP = {"p50": 0.5, "p75": 0.75, "p90": 0.9, "p95": 0.95, "p99": 0.99}
+# Columns of pull_request table (for LLM context)
+PR_COLUMNS = [
+    "id","actualpullrequestid","title","authorid","createdon","description",
+    "destinationbranch","sourcebranch","firstcommitid","sourcecommitid",
+    "destinationcommitid","state","repoid","linesadded","linesremoved",
+    "htmllink","commentcount","commitscount","modifiedfilescount","reason",
+    "updatedon","mergecommit","mergedby","firstreviewedby","approvedby",
+    "originalmergedby","mergedon","declinedon","reviewedon","approvedon",
+    "firstcommittedon","committoopenduration","opentoreviewduration",
+    "reviewedtoapprovedduration","reviewedtomergeeduration",
+    "approvedtomergedduration","reviewedtodeclineduration","opentodeclineduration",
+    "opentomergedduration","cycletimeduration","deploytimeduration",
+    "cycletimeoverflow","declinedby","remark","originalauthorid","createddate",
+    "modifieddate","originalapprovedby","originalfirstreviewedby",
+    "originaldeclinedby","processed","hotfixpr","reviewbranchpr",
+    "releasebranchpr","excludepr","flashyreviewedpr","jiramappingprocessed",
+    "labels","organizationid","workspaceid","prsentiment","issourcebranchdeleted",
+    "userintegrationid","jiradatacollected","reviewcyclecount","autoexcludepr",
+    "opentofirstcommentduration","firstcommenttoapproved","estimated_storypoints",
+    "comment_sentiment_count","is_deployment_pr","mergetodeployduration",
+    "deployment_record_id"
+]
 
+SYSTEM_PROMPT = f"""
+You are an expert SQL generator for PR metrics from the "insightly.pull_request" table.
+Columns available: {', '.join(PR_COLUMNS)}
 
-def _build_where_clause(window_days: int, filters: Optional[Dict[str, Any]]) -> Tuple[str, List[Any]]:
-    clauses: List[str] = [f"createdon >= NOW() - INTERVAL %s"]
-    params: List[Any] = [f"{int(window_days)} days"]
+Rules for generating SQL:
 
-    if filters:
-        for k, v in filters.items():
-            # allow equality filters only for now; parameterized
-            clauses.append(f"{k} = %s")
-            params.append(v)
+1. Always generate a **full PostgreSQL SELECT query**; do NOT explain it.
+2. Only use table "insightly.pull_request".
+3. Only SELECT statements allowed; no INSERT/UPDATE/DELETE.
+4. Always use psycopg2-style placeholders (%s) for values.
+5. Infer the correct aggregation based on the user request:
+   - If the user asks cycle time, churn etc, fetch required columns.
+   - If the user asks for averages, latencies, or durations, use AVG or PERCENTILE_CONT.
+   - If the user asks for counts, throughput, or number of PRs, use COUNT(*).
+   - For percentiles, use PERCENTILE_CONT and return named columns like p50, p75.
+6. Support optional grouping if user mentions "by team", "by author", "by repo", etc.
+7. Apply optional filtering if the user mentions criteria like repoid, authorid, date range, state.
+8. Support top-N results if user requests "top" PRs, e.g., top 5 slowest, top 10 churn PRs.
+9. Return a JSON object with:
+   - sql: string with the query
+   - params: list of values for parameters
+"""
 
-    where_sql = " AND ".join(clauses)
-    return where_sql, params
+def llm_generate_sql(user_prompt: str) -> Dict[str, Any]:
+    """Ask LLM to generate full SQL + params as JSON."""
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0
+        )
+        return json.loads(response.choices[0].message.content.strip())
+    except Exception as e:
+        return {"error": str(e)}
 
-
-def _explain_text(metric_name: str, agg: Optional[str], percentiles: Optional[List[str]], group_by: Optional[str]) -> str:
-    parts: List[str] = []
-    if percentiles:
-        parts.append(", ".join(percentiles).upper() + " (percentiles)")
-    if agg:
-        parts.append(agg.upper())
-    metric_desc = metric_name.replace("_", " ")
-    if group_by:
-        return f"Computed {', '.join(parts)} of `{metric_desc}` grouped by `{group_by}`."
-    return f"Computed {', '.join(parts)} of `{metric_desc}` overall."
-
-
-def get_metric(
-    metric_name: str,
-    window_days: int = 30,
-    filters: Optional[Dict[str, Any]] = None,
-    agg: Optional[str] = "avg",
-    percentiles: Optional[List[str]] = None,
-    group_by: Optional[str] = None,
-    top_n: Optional[int] = None,
-) -> Dict[str, Any]:
+def get_metric(user_prompt: str) -> Dict[str, Any]:
     """
-    Flexible metric tool.
-
-    Args:
-        metric_name: logical metric key from METRIC_MAP (e.g., "cycle_time", "churn", "throughput").
-        window_days: lookback window on pull_request.createdon (default 30).
-        filters: optional dict of equality filters (e.g., {"repoid": 5, "authorid": 123}).
-        agg: aggregation function as string (avg, min, max, sum, count). Ignored if percentiles provided or metric is throughput.
-        percentiles: list like ["p50","p75"] to compute percentiles instead of simple agg.
-        group_by: column to group by (e.g., "team_id", "authorid", "repoid").
-        top_n: if set and group_by is provided, limit results to top N ordered by primary stat (p50 if percentiles else agg).
-
-    Returns:
-        dict with keys:
-            - metric, window_days, sql, params, explanation, data (list of rows)
-        or {"error": "..."} on failure.
+    MCP tool: user prompt -> LLM SQL -> validate -> run -> return data.
     """
+    # Step 1: Generate SQL
+    sql_obj = llm_generate_sql(user_prompt)
+    if "error" in sql_obj:
+        return sql_obj
 
-    # Validate metric
-    if metric_name not in METRIC_MAP:
-        return {"error": f"Unknown metric: {metric_name}"}
+    sql = sql_obj.get("sql")
+    params = sql_obj.get("params", [])
 
-    metric_expr = METRIC_MAP[metric_name]
-    is_throughput = metric_name == "throughput"
-
-    # Build WHERE clause and params
-    where_sql, params = _build_where_clause(window_days, filters)
-
-    # Build SELECT expressions
-    select_parts: List[str] = []
-    order_by_expr = None  # used for top_n ordering
-
-    # Percentiles requested
-    if percentiles:
-        # Validate percentiles
-        pct_values = []
-        for p in percentiles:
-            if p not in PERCENTILE_MAP:
-                return {"error": f"Unsupported percentile: {p}. Supported: {list(PERCENTILE_MAP.keys())}"}
-            pct_values.append(PERCENTILE_MAP[p])
-
-        # Single percentile per column or multiple as array
-        # We'll use separate percentile_cont calls so returned columns are explicit
-        for p in percentiles:
-            expr = f"PERCENTILE_CONT({PERCENTILE_MAP[p]}) WITHIN GROUP (ORDER BY {metric_expr}) AS {p}"
-            select_parts.append(expr)
-
-        # Use first percentile for ordering if grouping & top_n
-        order_by_expr = percentiles[0] if percentiles else None
-
-    # If throughput, compute COUNT(*)
-    if is_throughput:
-        select_parts.append("COUNT(*) AS pr_count")
-        if not percentiles and not agg:
-            # default aggregator would be count
-            agg = "count"
-
-        if not order_by_expr:
-            order_by_expr = "pr_count"
-
-    # If not percentiles and not throughput, use agg function
-    if (not percentiles) and (not is_throughput):
-        if not agg or agg.lower() not in AGG_FUNCS:
-            return {"error": f"Unsupported agg: {agg}. Supported: {sorted(AGG_FUNCS)}"}
-        select_parts.append(f"{agg.upper()}({metric_expr}) AS {agg}_{metric_name}")
-        order_by_expr = f"{agg}_{metric_name}" if not order_by_expr else order_by_expr
-
-    # Build final SQL
-    schema_table = "insightly.pull_request"  # explicit schema.table as required
-    if group_by:
-        select_clause = f"{group_by}, " + ", ".join(select_parts)
-        group_clause = f"GROUP BY {group_by}"
-        order_clause = f"ORDER BY {order_by_expr} DESC" if order_by_expr else ""
-        limit_clause = f"LIMIT {int(top_n)}" if top_n else ""
-        sql = f"SELECT {select_clause} FROM {schema_table} WHERE {where_sql} {group_clause} {order_clause} {limit_clause};"
-    else:
-        select_clause = ", ".join(select_parts)
-        sql = f"SELECT {select_clause} FROM {schema_table} WHERE {where_sql};"
-
-    # Validate SQL using guard
+    # Step 2: Validate
     safe, reason = is_safe_sql(sql, schema_guard=True)
     if not safe:
-        return {"error": f"Generated SQL is not allowed: {reason}"}
+        return {"error": f"Unsafe SQL: {reason}", "sql": sql, "params": params}
 
-    # Execute the query
+    # Step 3: Execute
     try:
         conn = get_connection()
         cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -160,24 +105,4 @@ def get_metric(
     except Exception as e:
         return {"error": str(e), "sql": sql, "params": params}
 
-    # Normalize output shape
-    data = []
-    if group_by:
-        # rows are dicts: {group_by: value, <stat1>: val1, ...}
-        for r in rows:
-            data.append(dict(r))
-    else:
-        # single-row aggregates (or percentiles) -> return as dict
-        for r in rows:
-            data.append(dict(r))
-
-    explanation = _explain_text(metric_name, agg if not percentiles else None, percentiles, group_by)
-
-    return {
-        "metric": metric_name,
-        "window_days": window_days,
-        "sql": sql,
-        "params": params,
-        "explanation": explanation,
-        "data": data,
-    }
+    return {"sql": sql, "params": params, "data": [dict(r) for r in rows]}

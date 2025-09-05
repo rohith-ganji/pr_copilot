@@ -1,100 +1,101 @@
 # server/tables.py
 
-import psycopg2
-from psycopg2.extras import RealDictCursor
-from connection import get_connection
+import os
+from dotenv import load_dotenv
+from openai import OpenAI
+from sql_guard import is_safe_sql
+from query import run_query
+
+# Load env vars
+load_dotenv()
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
 
 # -------------------------
 # Tool: list_tables
 # -------------------------
-def list_tables():
+def list_tables(user_prompt: str):
     """
-    List only user tables in the 'insightly' schema with true row counts (COUNT(*)).
+    Uses OpenAI LLM to generate SQL for listing tables with row counts
+    in the 'insightly' schema, based on the user's natural language prompt.
     """
-    conn = get_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
 
-    # Get table names
-    cur.execute("""
-        SELECT table_name
-        FROM information_schema.tables
-        WHERE table_schema = 'insightly'
-          AND table_type = 'BASE TABLE';
-    """)
-    tables = cur.fetchall()
+    llm_prompt = f"""
+    You are an expert SQL generator. Convert the following user request into a valid PostgreSQL query.
 
-    results = []
-    for t in tables:
-        name = t["table_name"]
-        cur.execute(f'SELECT COUNT(*) AS row_count FROM insightly."{name}";')
-        count = cur.fetchone()["row_count"]
-        results.append({"table_name": name, "row_count": count})
+    User request: "{user_prompt}"
 
-    cur.close()
-    conn.close()
+    Constraints:
+    - Schema: insightly
+    - Output must be raw SQL only (no explanation, no markdown, no extra text).
+    - Only list tables available in the given schema.
+    Example Input:
+    "Show me all tables in the insightly schema"
 
-    return {"tables": results}
+    Example Output:
+    SELECT table_name
+    FROM information_schema.tables
+    WHERE table_schema = 'insightly';
+    """
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",   # or whichever model you use
+        messages=[
+            {"role": "system", "content": "You are a SQL generator."},
+            {"role": "user", "content": llm_prompt},
+        ],
+    )
+
+    sql = response.choices[0].message.content.strip()
+
+    if not is_safe_sql(sql):
+        return {"error": "Unsafe SQL detected", "query": sql}
+
+    results = run_query(sql)
+    return {"query": sql, "results": results}
 
 
 # -------------------------
 # Tool: get_related_tables
 # -------------------------
-def get_related_tables(table_name: str):
+def get_related_tables(user_prompt: str):
     """
-    Given a table name, find other tables in the schema that are related to it 
-    based on column naming conventions for foreign keys.
-
-    Logic:
-    - Looks at all columns in the schemas 'insightly' and 'hivel-code-review'.
-    - For each column in the given table:
-        * If the column name matches the pattern `<other_table>id` or `<other_table>_id`,
-          then that column is assumed to reference the `id` column of `<other_table>`.
-    - Returns a list of related tables with the inferred join condition.
-
-    Args:
-        table_name (str): The name of the table for which to find related tables.
-
-    Returns:
-        dict: {
-            "table": <input table name>,
-            "related": [
-                {"table": <related_table>, "via": "<table.column = related_table.id>"},
-                ...
-            ]
-        }
-
-    Example:
-        >>> get_related_tables("pr_update")
-        {
-            "table": "pr_update",
-            "related": [
-                {"table": "pull_request", "via": "pr_update.pullrequestid = pull_request.id"}
-            ]
-        }
+    Uses OpenAI LLM to generate SQL for finding related tables
+    in the 'insightly' and 'hivel-code-review' schemas, based on the user's prompt.
     """
-    conn = get_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
 
-    # Get all columns in the schema
-    cur.execute("""
-        SELECT table_name, column_name
-        FROM information_schema.columns
-        WHERE table_schema IN ('insightly', 'hivel-code-review');
-    """)
-    cols = cur.fetchall()
-    cur.close()
-    conn.close()
+    llm_prompt = f"""
+    You are an expert SQL generator. Convert the following natural language request into a PostgreSQL query.
 
-    # Normalize
-    tables = set([c["table_name"] for c in cols])
-    related = []
+    User request: "{user_prompt}"
 
-    for col in [c for c in cols if c["table_name"] == table_name]:
-        cname = col["column_name"].lower()
-        for t in tables:
-            if cname == f"{t}id" or cname == f"{t}_id":
-                related.append({"table": t, "via": f"{table_name}.{cname} = {t}.id"})
+    Constraints:
+    - Schemas: insightly, hivel-code-review
+    - Only generate SQL (no explanation, no markdown, no extra text).
+    - Ensure that the SQL checks for related tables by matching keywords in table names.
 
-    return {"table": table_name, "related": related}
+    Example Input:
+    "Find all tables related to pull requests"
 
+    Example Output:
+    SELECT table_name
+    FROM information_schema.tables
+    WHERE table_schema IN ('insightly', 'hivel-code-review')
+      AND table_name ILIKE '%pull_request%';
+    """
 
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "You are a SQL generator."},
+            {"role": "user", "content": llm_prompt},
+        ],
+    )
+
+    sql = response.choices[0].message.content.strip()
+
+    if not is_safe_sql(sql):
+        return {"error": "Unsafe SQL detected", "query": sql}
+
+    results = run_query(sql)
+    return {"query": sql, "results": results}
