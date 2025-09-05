@@ -75,7 +75,7 @@ cd pr_2
 Install dependencies from requirements.txt
 
  To run client:
- python client.py
+ python client2.py
 
  To run MCP Server:
  uv run server/fastmcp_server.py
