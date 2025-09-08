@@ -56,4 +56,4 @@ Install dependencies from requirements.txt
  uv run server/fastmcp_server.py
 
 
- test
+ 
