@@ -54,3 +54,6 @@ Install dependencies from requirements.txt
 
  To run MCP Server:
  uv run server/fastmcp_server.py
+
+
+ 
